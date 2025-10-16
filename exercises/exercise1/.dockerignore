@@ -1,0 +1,90 @@
+# Docker ignore file to minimize build context and improve build speed
+# Prevents unnecessary files from being sent to Docker daemon during build
+
+# Git version control
+.git/
+.gitignore
+.gitattributes
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation
+README.md
+*.md
+docs/
+documentation/
+
+# Testing
+tests/
+test/
+*.test
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.*
+*.env
+
+# AWS credentials (critical security)
+.aws/
+credentials
+*.pem
+*.key
+
+# Terraform state (should never be in app directory but extra safety)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Scripts directory (not needed in container)
+scripts/
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+
+# Container files (don't need Dockerfile in the image)
+Dockerfile*
+.dockerignore
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak

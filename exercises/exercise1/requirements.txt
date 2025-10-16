@@ -1,0 +1,20 @@
+# =============================================================================
+# Python Dependencies for SRE-Instrumented Application
+# =============================================================================
+# All dependencies are pinned to specific versions for reproducible builds
+# and security. Update versions deliberately after security review.
+# =============================================================================
+
+# Web Framework
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Prometheus Metrics
+prometheus-client==0.19.0
+
+# Production WSGI Server (optional, for production deployment)
+gunicorn==21.2.0
+
+# Logging Enhancement (already in Python stdlib but explicit for clarity)
+# structlog provides structured logging utilities
+# Note: Using stdlib logging with JSON output, structlog is optional enhancement

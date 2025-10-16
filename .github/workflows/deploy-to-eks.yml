@@ -1,0 +1,286 @@
+name: Deploy to EKS (Imperative)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      image_tag:
+        description: 'Container image tag to deploy'
+        required: true
+        default: 'latest'
+      eks_cluster_name:
+        description: 'EKS cluster name'
+        required: true
+        default: 'devops-demo-cluster'  # <REPLACE: Set your EKS cluster name>
+
+env:
+  AWS_REGION: us-east-1  # <REPLACE: Set your AWS region>
+  ECR_REPOSITORY: devops-demo-app  # <REPLACE: Set your ECR repository name>
+  KUBE_NAMESPACE: default  # <REPLACE: Set your Kubernetes namespace>
+
+# Use OIDC for AWS authentication (no long-lived credentials)
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-deployment:
+    name: Validate Deployment Configuration
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Validate Kubernetes Manifests
+        run: |
+          # Install kubeval for manifest validation
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+          
+          # Validate all manifests
+          find exercises/exercise4/k8s -name "*.yaml" -exec kubeval {} \;
+
+      - name: Check Deployment Readiness
+        run: |
+          echo "### Deployment Validation :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** ${{ github.event.inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**EKS Cluster:** ${{ github.event.inputs.eks_cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** ${{ env.KUBE_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+
+  deploy-to-eks:
+    name: Deploy Application to EKS
+    runs-on: ubuntu-latest
+    needs: validate-deployment
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<REPLACE_AWS_ACCOUNT_ID>:role/GitHubActionsEKSDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsEKSDeploy
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.29.0'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ github.event.inputs.eks_cluster_name }}
+
+      - name: Verify Cluster Connectivity
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create/Update Namespace
+        run: |
+          kubectl create namespace ${{ env.KUBE_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Prepare Deployment Manifests
+        run: |
+          cd exercises/exercise4/k8s
+          
+          # Update image tag in deployment manifest
+          sed -i "s|image:.*$|image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}|g" deployment.yaml
+          
+          # Add deployment labels
+          kubectl label namespace ${{ env.KUBE_NAMESPACE }} \
+            environment=${{ github.event.inputs.environment }} \
+            managed-by=github-actions \
+            --overwrite || true
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Apply ConfigMap
+        run: |
+          kubectl apply -f exercises/exercise4/k8s/configmap.yaml -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Apply Service
+        run: |
+          kubectl apply -f exercises/exercise4/k8s/service.yaml -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Apply Deployment
+        run: |
+          cd exercises/exercise4/k8s
+          kubectl apply -f deployment.yaml -n ${{ env.KUBE_NAMESPACE }}
+          
+          # Wait for rollout to complete
+          kubectl rollout status deployment/devops-demo-app \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --timeout=5m
+
+      - name: Apply Horizontal Pod Autoscaler
+        run: |
+          kubectl apply -f exercises/exercise4/k8s/hpa.yaml -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Apply Ingress (if exists)
+        run: |
+          if [ -f exercises/exercise4/k8s/ingress.yaml ]; then
+            kubectl apply -f exercises/exercise4/k8s/ingress.yaml -n ${{ env.KUBE_NAMESPACE }}
+          fi
+        continue-on-error: true
+
+      - name: Verify Deployment Health
+        run: |
+          echo "Checking deployment health..."
+          
+          # Check pod status
+          kubectl get pods -n ${{ env.KUBE_NAMESPACE }} -l app=devops-demo-app
+          
+          # Check deployment status
+          kubectl get deployment devops-demo-app -n ${{ env.KUBE_NAMESPACE }}
+          
+          # Check service status
+          kubectl get service devops-demo-app-service -n ${{ env.KUBE_NAMESPACE }}
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod \
+            -l app=devops-demo-app \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --timeout=300s
+
+      - name: Get Service Endpoint
+        id: get-endpoint
+        run: |
+          # Wait for LoadBalancer to get external IP
+          echo "Waiting for LoadBalancer external IP..."
+          
+          for i in {1..30}; do
+            EXTERNAL_IP=$(kubectl get service devops-demo-app-service \
+              -n ${{ env.KUBE_NAMESPACE }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            
+            if [ -n "$EXTERNAL_IP" ]; then
+              echo "endpoint=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+              echo "External endpoint: $EXTERNAL_IP"
+              break
+            fi
+            
+            echo "Waiting for external IP... (attempt $i/30)"
+            sleep 10
+          done
+
+      - name: Test Application Health
+        if: steps.get-endpoint.outputs.endpoint != ''
+        run: |
+          ENDPOINT="${{ steps.get-endpoint.outputs.endpoint }}"
+          
+          echo "Testing application health at: $ENDPOINT"
+          
+          # Wait for DNS propagation
+          sleep 30
+          
+          # Test health endpoint
+          curl -f -m 10 http://$ENDPOINT/health || echo "Health check pending..."
+          
+          # Test readiness endpoint
+          curl -f -m 10 http://$ENDPOINT/ready || echo "Readiness check pending..."
+        continue-on-error: true
+
+      - name: Get Pod Logs
+        if: always()
+        run: |
+          echo "### Application Pod Logs" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl logs -n ${{ env.KUBE_NAMESPACE }} \
+            -l app=devops-demo-app \
+            --tail=50 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Create Deployment Summary
+        if: always()
+        run: |
+          echo "### Deployment Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Cluster:** ${{ github.event.inputs.eks_cluster_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** ${{ env.KUBE_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ steps.get-endpoint.outputs.endpoint }}" ]; then
+            echo "**Application Endpoint:** http://${{ steps.get-endpoint.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Application Endpoint:** Pending LoadBalancer provisioning" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Status:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get deployment devops-demo-app -n ${{ env.KUBE_NAMESPACE }} >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pod Status:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ env.KUBE_NAMESPACE }} -l app=devops-demo-app >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  rollback-on-failure:
+    name: Rollback on Deployment Failure
+    runs-on: ubuntu-latest
+    needs: deploy-to-eks
+    if: failure()
+    
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<REPLACE_AWS_ACCOUNT_ID>:role/GitHubActionsEKSDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsEKSRollback
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.29.0'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ github.event.inputs.eks_cluster_name }}
+
+      - name: Rollback Deployment
+        run: |
+          echo "Deployment failed. Initiating rollback..."
+          
+          kubectl rollout undo deployment/devops-demo-app \
+            -n ${{ env.KUBE_NAMESPACE }}
+          
+          kubectl rollout status deployment/devops-demo-app \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --timeout=5m
+
+      - name: Create Rollback Summary
+        run: |
+          echo "### Rollback Executed :warning:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deployment failed and has been rolled back to previous version." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Current Deployment Status:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get deployment devops-demo-app -n ${{ env.KUBE_NAMESPACE }} >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
